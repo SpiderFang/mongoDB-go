@@ -148,9 +148,15 @@ func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo str
 
 	// 批次寫入 MongoDB
 	if len(documents) > 0 {
-		_, err := collection.InsertMany(context.TODO(), documents)
+		// 使用無序寫入 (Unordered Writes) 來提升效能並允許部分失敗
+		// 即使有幾筆資料因重複或其他原因寫入失敗，其他資料仍會繼續寫入
+		opts := options.InsertMany().SetOrdered(false)
+		_, err := collection.InsertMany(context.TODO(), documents, opts)
 		if err != nil {
-			panic(fmt.Errorf("寫入 MongoDB 失敗: %v", err))
+			// 在無序寫入模式下，即使有錯誤，err 也不一定代表所有操作都失敗。
+			// 這裡可以記錄錯誤，但建議不要直接 panic，以免中斷整個程式。
+			// mongo.BulkWriteException 包含了哪些成功、哪些失敗的詳細資訊。
+			fmt.Printf("股票代號 %s 寫入 MongoDB 時發生錯誤 (部分資料可能寫入失敗): %v\n", stockNo, err)
 		}
 		fmt.Printf("成功寫入 %d 筆資料至 MongoDB\n", len(documents))
 	}
