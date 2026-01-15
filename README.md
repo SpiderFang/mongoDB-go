@@ -116,3 +116,25 @@ go get go.mongodb.org/mongo-driver/mongo
 2. 控制每次 InsertMany 的數量在 1000-5000 筆之間。
 3. 如果是初始化資料庫，先寫資料，後建索引。
 4. 根據需求調整 Write Concern。
+
+
+## 關於 InsertMany 操作中若有單筆資料寫入失敗該如何處理？
+
+在使用 `InsertMany` 操作時，如果有單筆資料寫入失敗，MongoDB Driver 會回傳一個錯誤，這個錯誤中包含了部分成功與失敗的資訊。
+這個問題的處理方式，取決於您對 InsertMany 的設定。基本上有兩種模式：
+1. 有序寫入 (Ordered Inserts - 預設行為)：這是 InsertMany 的預設模式。MongoDB 會依照您提供的資料順序逐筆寫入。如果中間有一筆資料寫入失敗（例如 _id 重複），整個寫入操作就會立刻中斷，後續的資料將不會被寫入。
+2. 無序寫入 (Unordered Inserts)：您可以手動設定此模式。在無序模式下，MongoDB 會嘗試寫入所有您提供的資料，即使中間有幾筆失敗，它也會跳過錯誤的資料，繼續寫入剩下的部分。MongoDB Server 甚至可能為了提升效能而平行處理這些寫入。
+
+建議採用「無序寫入」，這麼做有兩個主要好處：
+1. 容錯性：單筆資料的失敗（例如網路波動、資料格式錯誤、唯一鍵衝突）不會導致整個批次的任務中斷。
+2. 高效能：允許 MongoDB 平行處理寫入請求，通常能顯著提升大量資料寫入時的吞吐量。
+
+程式碼修改：
+要啟用無序寫入，您需要在呼叫 InsertMany 時傳入一個 options 物件，並將 Ordered 設為 false。同時，錯誤處理也應該更加細緻，而不是直接 panic。
+
+修改重點說明：
+1. 引入 options：go.mongodb.org/mongo-driver/mongo/options 套件讓您可以對資料庫操作進行細部設定。雖然您的程式碼中已經引入了 options，但在 scrapeStock 函式中我們將明確使用它。
+2. 設定 SetOrdered(false)：我們建立一個 options.InsertMany() 的實例，並呼叫 SetOrdered(false) 來告訴 MongoDB 執行無序寫入。
+3. 傳入 opts：將設定好的 opts 物件作為 collection.InsertMany 的第三個參數傳入。
+4. 改善錯誤處理：當使用無序寫入時，回傳的 err 可能是 mongo.BulkWriteException 型別。這個錯誤物件內部其實包含了哪些資料寫入成功、哪些失敗的詳細資訊。因此，我們不再使用 panic 來粗暴地終止程式，而是改用 fmt.Printf 印出錯誤，讓主程式可以繼續處理下一個股票代號。
+透過這樣的修改，您的爬蟲程式將會更加健壯且高效。
