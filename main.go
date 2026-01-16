@@ -151,14 +151,33 @@ func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo str
 		// 使用無序寫入 (Unordered Writes) 來提升效能並允許部分失敗
 		// 即使有幾筆資料因重複或其他原因寫入失敗，其他資料仍會繼續寫入
 		opts := options.InsertMany().SetOrdered(false)
-		_, err := collection.InsertMany(context.TODO(), documents, opts)
+		insertResult, err := collection.InsertMany(context.TODO(), documents, opts)
 		if err != nil {
-			// 在無序寫入模式下，即使有錯誤，err 也不一定代表所有操作都失敗。
-			// 這裡可以記錄錯誤，但建議不要直接 panic，以免中斷整個程式。
-			// mongo.BulkWriteException 包含了哪些成功、哪些失敗的詳細資訊。
-			fmt.Printf("股票代號 %s 寫入 MongoDB 時發生錯誤 (部分資料可能寫入失敗): %v\n", stockNo, err)
+			fmt.Printf("股票代號 %s 寫入 MongoDB 時發生錯誤\n", stockNo)
+
+			// 進行類型斷言，判斷錯誤是否為 BulkWriteException
+			if bulkWriteException, ok := err.(mongo.BulkWriteException); ok {
+				// 即使有錯誤，部分資料可能也寫入成功了
+				if len(insertResult.InsertedIDs) > 0 {
+					fmt.Printf("  => 成功寫入 %d 筆資料。\n", len(insertResult.InsertedIDs))
+				}
+
+				fmt.Printf("  => 但有 %d 筆資料寫入失敗:\n", len(bulkWriteException.WriteErrors))
+				// 遍歷所有寫入錯誤
+				for _, e := range bulkWriteException.WriteErrors {
+					// e.Index 是失敗文件在原始 documents 切片中的索引
+					// failedDoc := documents[e.Index] // 這就是失敗的那筆文件
+					fmt.Printf("    - 原因: %s (錯誤碼: %d), 失敗文件的索引: %d\n", e.Message, e.Code, e.Index)
+					// 在實際應用中，你可以將 failedDoc 存入一個 "dead-letter queue" 或日誌文件中，以便後續處理
+					// 例如: logFailedDocument(failedDoc)
+				}
+			} else {
+				// 如果不是 BulkWriteException，可能是連線中斷等更嚴重的問題
+				fmt.Printf("  => 發生非預期的寫入錯誤: %v\n", err)
+			}
+		} else {
+			fmt.Printf("成功寫入 %d 筆資料至 MongoDB\n", len(insertResult.InsertedIDs))
 		}
-		fmt.Printf("成功寫入 %d 筆資料至 MongoDB\n", len(documents))
 	}
 }
 

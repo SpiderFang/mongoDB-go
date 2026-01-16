@@ -138,3 +138,34 @@ go get go.mongodb.org/mongo-driver/mongo
 3. 傳入 opts：將設定好的 opts 物件作為 collection.InsertMany 的第三個參數傳入。
 4. 改善錯誤處理：當使用無序寫入時，回傳的 err 可能是 mongo.BulkWriteException 型別。這個錯誤物件內部其實包含了哪些資料寫入成功、哪些失敗的詳細資訊。因此，我們不再使用 panic 來粗暴地終止程式，而是改用 fmt.Printf 印出錯誤，讓主程式可以繼續處理下一個股票代號。
 透過這樣的修改，您的爬蟲程式將會更加健壯且高效。
+
+
+## 當使用無序寫入（Unordered Writes）時，知道如何處理那些失敗的資料，是確保資料完整性和系統健壯性的重要一步。
+
+當 InsertMany 在無序模式下發生錯誤時，MongoDB Driver 會回傳一個 mongo.BulkWriteException 型別的錯誤。這個錯誤物件並不像一般錯誤那樣只是一條訊息，它內部詳細記錄了每一筆失敗的資訊。
+
+* 處理失敗寫入的策略
+
+處理這些失敗資料的常見策略有以下幾種：
+
+1. 詳細記錄 (Logging)：最基本也最重要的步驟。將失敗的文件、失敗原因（例如：重複的 _id）、錯誤碼都記錄到你的日誌系統中，方便後續追蹤和分析。
+2. 重試機制 (Retry)：如果失敗的原因是暫時性的（例如：網路抖動、暫時的資料庫超載），你可以設計一個重試邏輯。但要注意，像「主鍵衝突 (Duplicate Key)」這種錯誤是永久性的，重試也沒用，應該直接跳過或記錄。
+3. 存入「死信佇列」(Dead-Letter Queue)：這是最推薦的健壯作法。將所有處理失敗的文件存到另一個地方，例如一個專門的 MongoDB Collection、一個日誌檔案，或是像 RabbitMQ、Kafka 這樣的訊息佇列。這樣做的好處是：
+    - 主程式可以繼續正常運作，不受影響。
+    - 你可以事後再寫一個獨立的程式或手動去分析和處理這些「死信」，看是要修正資料後重新匯入，還是直接捨棄。
+
+* 程式碼實作
+接下來，我將修改 main.go 中的 scrapeStock 函式，向你展示如何解析 mongo.BulkWriteException 並取得失敗的詳細資訊。
+
+我們將修改原本的錯誤處理區塊，進行類型斷言（Type Assertion），並遍歷其中的 WriteErrors。
+
+* 修改重點說明
+
+1. 接收 insertResult：我們不再用 _ 忽略 InsertMany 的第一個回傳值，而是用 insertResult 接收它。insertResult.InsertedIDs 包含了一個由所有成功寫入文件的 _id 組成的列表，我們可以透過 len(insertResult.InsertedIDs) 精確地知道有多少筆資料成功了。
+2. 類型斷言：我們使用 if bulkWriteException, ok := err.(mongo.BulkWriteException); ok 來檢查回傳的 err 是否是我們預期的 BulkWriteException。
+3. 遍歷 WriteErrors：如果斷言成功，我們就可以遍歷 bulkWriteException.WriteErrors。這是一個切片（Slice），裡面存放了所有失敗的詳細資訊。
+4. 取得失敗詳情：在迴圈中，e.Message 和 e.Code 提供了失敗的原因和錯誤碼（例如，11000 代表 E11000 duplicate key error）。e.Index 則告訴你這筆失敗的資料在原始 documents 切片中的索引位置。
+5. 取得失敗文件：透過 e.Index，你可以用 documents[e.Index] 輕鬆地取回完整的失敗文件，然後決定要如何處理它（例如寫入日誌或死信佇列）。
+6. 更精確的成功計數：無論成功還是部分失敗，我們都改用 len(insertResult.InsertedIDs) 來顯示實際成功寫入的筆數，這比之前用 len(documents) 更加準確。
+
+透過這種方式，你的程式不僅能容忍部分失敗，還能精確地追蹤到每一筆失敗的資料，讓後續的維護和資料補救工作變得有據可依。
