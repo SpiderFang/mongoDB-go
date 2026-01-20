@@ -169,3 +169,34 @@ go get go.mongodb.org/mongo-driver/mongo
 6. 更精確的成功計數：無論成功還是部分失敗，我們都改用 len(insertResult.InsertedIDs) 來顯示實際成功寫入的筆數，這比之前用 len(documents) 更加準確。
 
 透過這種方式，你的程式不僅能容忍部分失敗，還能精確地追蹤到每一筆失敗的資料，讓後續的維護和資料補救工作變得有據可依。
+
+
+## 在實際應用中，可以將 failedDoc 存入一個 "dead-letter queue" 或日誌文件中，以便後續處理
+
+這是一個非常實用的需求。在本地執行的爬蟲或小型工具中，最簡單且有效的「死信佇列 (Dead-Letter Queue)」實作方式，就是將失敗的資料寫入一個本地的 JSON 檔案。
+
+這樣做的好處是格式通用（JSON），方便你之後用其他程式讀取、分析，甚至直接修正後重新匯入 MongoDB。
+
+由於程式是並發執行（多個 Goroutine 同時跑），寫入同一個檔案時必須注意執行緒安全 (Thread Safety)。我們需要使用 sync.Mutex 來確保不會有兩個人同時寫入檔案導致內容錯亂。
+
+以下是具體的實作步驟與程式碼修改：
+修改計畫說明：
+1. 引入套件：加入 encoding/json 用於序列化資料。
+2. 加入全域鎖 (Mutex)：宣告一個 failureLogMutex 來保護日誌檔案的寫入操作。
+3. 實作 logFailedDocument 函式：這個函式會接收失敗的文件與錯誤訊息，將其包裝成 JSON 格式並「附加 (Append)」到 failed_inserts.json 檔案中。
+4. 呼叫函式：在 scrapeStock 的錯誤處理迴圈中呼叫此函式。
+
+實作細節說明:
+1. failureLogMutex：
+   - 因為您的程式使用了 Goroutine 並發執行，多個股票可能同時發生寫入錯誤。如果不加鎖，同時寫入同一個檔案會導致內容交錯亂碼。
+   - Lock() 和 Unlock() 確保同一時間只有一個 Goroutine 能寫入檔案。
+
+2. logFailedDocument 函式：
+    - 結構化記錄：我們定義了一個 LogEntry 結構，不僅儲存原始資料 (Document)，還加上了 Timestamp (發生時間)、ErrorCode (錯誤碼) 和 ErrorMsg (錯誤訊息)。這對後續排查問題非常有幫助。
+   - 檔案模式：使用 os.O_APPEND|os.O_CREATE|os.O_WRONLY 開啟檔案。這表示如果檔案不存在就建立；如果存在，則將新資料寫在檔案的最後面 (Append)，而不是覆蓋舊資料。
+   - JSON Encoder：json.NewEncoder(f).Encode(entry) 會自動將結構轉為 JSON 字串並寫入檔案，且會自動換行。這樣產生的檔案格式稱為 JSON Lines，每一行都是一個獨立且完整的 JSON 物件。
+
+後續如何使用這個檔案？
+當程式跑完後，如果 failed_inserts.json 產生了，您可以：
+1. 檢視錯誤：直接用文字編輯器打開，查看 error_msg 欄位了解失敗原因。
+2. 重試/補救：您可以寫另一個簡單的 Go 程式或 Python 腳本，逐行讀取這個檔案，修正資料（例如修改重複的 ID），然後重新 Insert 到 MongoDB 中。

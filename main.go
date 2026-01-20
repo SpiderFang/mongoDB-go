@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+var failureLogMutex sync.Mutex // 用於確保並發寫入日誌檔案時的安全
 
 func main() {
 	url := launcher.New().
@@ -166,10 +169,10 @@ func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo str
 				// 遍歷所有寫入錯誤
 				for _, e := range bulkWriteException.WriteErrors {
 					// e.Index 是失敗文件在原始 documents 切片中的索引
-					// failedDoc := documents[e.Index] // 這就是失敗的那筆文件
+					failedDoc := documents[e.Index] // 這就是失敗的那筆文件
 					fmt.Printf("    - 原因: %s (錯誤碼: %d), 失敗文件的索引: %d\n", e.Message, e.Code, e.Index)
 					// 在實際應用中，你可以將 failedDoc 存入一個 "dead-letter queue" 或日誌文件中，以便後續處理
-					// 例如: logFailedDocument(failedDoc)
+					logFailedDocument(failedDoc, e.Code, e.Message)
 				}
 			} else {
 				// 如果不是 BulkWriteException，可能是連線中斷等更嚴重的問題
@@ -206,6 +209,41 @@ func readCSV(filename string) ([]string, error) {
 		}
 	}
 	return list, nil
+}
+
+// logFailedDocument 將失敗的寫入操作記錄到 JSON 檔案中 (Dead Letter Queue)
+func logFailedDocument(doc interface{}, code int, msg string) {
+	failureLogMutex.Lock()
+	defer failureLogMutex.Unlock()
+
+	// 定義日誌結構，包含錯誤資訊與原始資料
+	type LogEntry struct {
+		Timestamp string      `json:"timestamp"`
+		ErrorCode int         `json:"error_code"`
+		ErrorMsg  string      `json:"error_msg"`
+		Document  interface{} `json:"document"`
+	}
+
+	entry := LogEntry{
+		Timestamp: time.Now().Format(time.RFC3339),
+		ErrorCode: code,
+		ErrorMsg:  msg,
+		Document:  doc,
+	}
+
+	// 開啟檔案 (Append 模式)，如果不存在則建立
+	f, err := os.OpenFile("failed_inserts.json", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("無法開啟失敗日誌檔案: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	// 寫入 JSON
+	encoder := json.NewEncoder(f)
+	if err := encoder.Encode(entry); err != nil {
+		fmt.Printf("寫入失敗日誌時發生錯誤: %v\n", err)
+	}
 }
 
 /*
