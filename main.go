@@ -19,6 +19,11 @@ import (
 
 var failureLogMutex sync.Mutex // 用於確保並發寫入日誌檔案時的安全
 
+type StockData struct {
+	StockNo   string
+	Documents []interface{}
+}
+
 func main() {
 	url := launcher.New().
 		Headless(false).
@@ -51,6 +56,18 @@ func main() {
 		panic(fmt.Errorf("讀取股票列表失敗: %v", err))
 	}
 
+	// 建立 MongoDB 寫入工作的 Channel (Buffer 設定為 100，作為 Producer 與 Consumer 之間的緩衝)
+	// 這樣爬蟲 (Producer) 不用等待資料庫寫入完成，可以立刻處理下一頁
+	dbChan := make(chan StockData, 100)
+	var wgDB sync.WaitGroup
+
+	// 啟動 Worker Pool (Consumer)
+	// 這裡啟動 2 個 Goroutine 專門負責寫入資料庫，控制 DB 連線數
+	for i := 0; i < 2; i++ {
+		wgDB.Add(1)
+		go dbWorker(i, collection, dbChan, &wgDB)
+	}
+
 	var wg sync.WaitGroup
 	// 建立一個容量為 3 的 buffered channel，用來限制同時執行的數量 (Semaphore)
 	sem := make(chan struct{}, 3)
@@ -67,13 +84,23 @@ func main() {
 					fmt.Printf("股票代號 %s 發生錯誤 (跳過): %v\n", id, r)
 				}
 			}()
-			scrapeStock(browser, collection, id)
+			// 爬蟲 (Producer) 只負責抓取並將資料丟入 Channel
+			scrapeStock(browser, dbChan, id)
 		}(stockNo)
 	}
+
+	// 優雅關閉 (Graceful Shutdown) 流程：
+	// 1. 等待所有爬蟲 (Producers) 完成任務
 	wg.Wait()
+	// 2. 關閉 Channel，這會向所有 Worker 發送「沒有更多資料」的訊號
+	//    Worker 內部的 range 迴圈會因此結束
+	close(dbChan)
+
+	// 3. 等待所有 Worker (Consumers) 把 Channel 剩餘資料寫完並結束
+	wgDB.Wait()
 }
 
-func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo string) {
+func scrapeStock(browser *rod.Browser, dbChan chan<- StockData, stockNo string) {
 	fmt.Printf("正在處理股票代號: %s\n", stockNo)
 	page := browser.MustPage("https://www.twse.com.tw/zh/trading/historical/stock-day-avg.html")
 	defer page.MustClose() // 確保每個分頁處理完後關閉
@@ -149,19 +176,32 @@ func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo str
 	}
 	fmt.Printf("已儲存至 %s\n\n", fileName)
 
-	// 批次寫入 MongoDB
+	// Producer: 將資料傳送至 Channel
+	// 這裡取代了原本直接寫入 DB 的邏輯，實現了解耦
 	if len(documents) > 0 {
+		dbChan <- StockData{
+			StockNo:   stockNo,
+			Documents: documents,
+		}
+	}
+}
+
+// dbWorker 是消費者 (Consumer)，負責從 Channel 接收資料並寫入 MongoDB
+func dbWorker(id int, collection *mongo.Collection, jobs <-chan StockData, wg *sync.WaitGroup) {
+	defer wg.Done()
+	// 當 jobs Channel 被關閉且緩衝區清空後，這個迴圈會自動結束
+	for job := range jobs {
 		// 使用無序寫入 (Unordered Writes) 來提升效能並允許部分失敗
 		// 即使有幾筆資料因重複或其他原因寫入失敗，其他資料仍會繼續寫入
 		opts := options.InsertMany().SetOrdered(false)
-		insertResult, err := collection.InsertMany(context.TODO(), documents, opts)
+		insertResult, err := collection.InsertMany(context.TODO(), job.Documents, opts)
 		if err != nil {
-			fmt.Printf("股票代號 %s 寫入 MongoDB 時發生錯誤\n", stockNo)
+			fmt.Printf("[Worker %d] 股票代號 %s 寫入 MongoDB 時發生錯誤\n", id, job.StockNo)
 
 			// 進行類型斷言，判斷錯誤是否為 BulkWriteException
 			if bulkWriteException, ok := err.(mongo.BulkWriteException); ok {
 				// 即使有錯誤，部分資料可能也寫入成功了
-				if len(insertResult.InsertedIDs) > 0 {
+				if insertResult != nil && len(insertResult.InsertedIDs) > 0 {
 					fmt.Printf("  => 成功寫入 %d 筆資料。\n", len(insertResult.InsertedIDs))
 				}
 
@@ -169,9 +209,10 @@ func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo str
 				// 遍歷所有寫入錯誤
 				for _, e := range bulkWriteException.WriteErrors {
 					// e.Index 是失敗文件在原始 documents 切片中的索引
-					failedDoc := documents[e.Index] // 這就是失敗的那筆文件
+					failedDoc := job.Documents[e.Index] // 這就是失敗的那筆文件
 					fmt.Printf("    - 原因: %s (錯誤碼: %d), 失敗文件的索引: %d\n", e.Message, e.Code, e.Index)
 					// 在實際應用中，你可以將 failedDoc 存入一個 "dead-letter queue" 或日誌文件中，以便後續處理
+					// 記錄失敗的文件
 					logFailedDocument(failedDoc, e.Code, e.Message)
 				}
 			} else {
@@ -179,7 +220,7 @@ func scrapeStock(browser *rod.Browser, collection *mongo.Collection, stockNo str
 				fmt.Printf("  => 發生非預期的寫入錯誤: %v\n", err)
 			}
 		} else {
-			fmt.Printf("成功寫入 %d 筆資料至 MongoDB\n", len(insertResult.InsertedIDs))
+			fmt.Printf("[Worker %d] 成功寫入 %d 筆資料至 MongoDB (股票代號: %s)\n", id, len(insertResult.InsertedIDs), job.StockNo)
 		}
 	}
 }

@@ -200,3 +200,74 @@ go get go.mongodb.org/mongo-driver/mongo
 當程式跑完後，如果 failed_inserts.json 產生了，您可以：
 1. 檢視錯誤：直接用文字編輯器打開，查看 error_msg 欄位了解失敗原因。
 2. 重試/補救：您可以寫另一個簡單的 Go 程式或 Python 腳本，逐行讀取這個檔案，修正資料（例如修改重複的 ID），然後重新 Insert 到 MongoDB 中。
+
+
+# 重構程式碼, 將「爬蟲 (Producer)」與「資料庫寫入 (Consumer)」解耦
+
+將「爬蟲 (Producer)」與「資料庫寫入 (Consumer)」解耦，可以讓爬蟲專注於抓取資料（IO Bound，但受限於網速與網站限制），而資料庫寫入則由專門的 Worker 處理（IO Bound，但速度通常較快且穩定）。
+
+這樣的 Worker Pool 模式有幾個好處：
+1. 職責分離：爬蟲不再需要等待資料庫寫入完成才能處理下一頁。
+2. 錯誤隔離：資料庫寫入的暫時性錯誤不會直接卡住爬蟲流程。
+3. 流量控制：你可以固定資料庫的連線數（例如 2 個 Worker），避免因為爬蟲開太多併發而瞬間灌爆資料庫連線。
+
+以下是修改後的程式碼，主要變動如下：
+
+1. 新增 StockData 結構，用於在 Channel 中傳遞資料。這是一個簡單的結構體，用來封裝從爬蟲抓取到的資料。它包含了 StockID、Date 和 Price 三個欄位，這些都是我們最終要寫入 MongoDB 的資料。
+2. 在 main 中建立 dbChan (Channel) 與啟動 dbWorker (Consumer)。
+3. 修改 scrapeStock，將原本的寫入邏輯改為「發送資料到 Channel」。
+4. 新增 dbWorker 函式，專門負責從 Channel 接收資料並寫入 MongoDB。
+
+詳細架構說明：
+
+這個模式將程式拆解為三個主要部分，就像工廠的流水線一樣：
+
+A. 輸送帶 (Channel)
+```go
+dbChan := make(chan StockData, 100)
+```
+* 角色：這是連接爬蟲與資料庫的「緩衝區」。
+* 為什麼要 Buffer (100)？：
+    * 如果沒有 Buffer (容量為 0)，爬蟲抓完資料要丟進去時，必須等待 Worker 剛好有空來拿，否則爬蟲會卡住 (Block)。
+    * 有了 Buffer，爬蟲抓完資料丟進 Channel 就可以立刻去抓下一頁，不用管資料庫寫入是否來得及。這就是解耦 (Decoupling)。
+
+B. 生產者 (Producer) - scrapeStock
+```go
+// 舊做法：直接寫入 DB (會卡住等待 DB 回應)
+// collection.InsertMany(...)
+
+// 新做法：丟進 Channel 就跑
+dbChan <- StockData{StockNo: stockNo, Documents: documents}
+```
+* 職責：只負責「抓資料」和「整理資料」。
+* 優點：爬蟲是 IO Bound (網路)，通常很慢。我們不希望它因為資料庫連線慢或鎖定而變更慢。現在它只要把資料丟上輸送帶，任務就結束了。
+
+C. 消費者 (Consumer) - dbWorker
+```go
+func dbWorker(id int, collection *mongo.Collection, jobs <-chan StockData, wg *sync.WaitGroup) {
+    for job := range jobs {
+        // 專心處理寫入資料庫
+        collection.InsertMany(...)
+    }
+}
+```
+* 職責：只負責「寫入資料庫」。
+* 併發控制：你在 main 中啟動了 2 個 Worker。這意味著無論你有 10 個還是 100 個爬蟲在跑，同時對 MongoDB 的連線數永遠只有 2 個。
+* 保護資料庫：這能避免因為爬蟲開太多，瞬間產生大量連線把 MongoDB 打掛 (Connection Storm)。
+
+## 優雅關閉 (Graceful Shutdown) 的流程
+如何安全地結束程式，確保資料不遺失：
+1. 爬蟲工作 (wg)：主程式等待所有爬蟲完成 (wg.Wait())。
+2. 關閉通道 (close(dbChan))：
+    * 當所有爬蟲都結束了，表示不會再有新資料進來了。
+    * 這時我們關閉 Channel。這就像在輸送帶入口掛上「停止進貨」的牌子。
+3. Worker 收尾：
+    * Worker 中的 for job := range jobs 迴圈會偵測到 Channel 被關閉且資料已讀完，然後自動跳出迴圈。
+4. 等待寫入完成 (wgDB)：
+    * 主程式最後等待 Worker 把輸送帶上剩餘的貨物都處理完 (wgDB.Wait())，才真正結束程式。
+
+## 總結優點
+
+1. 速度更快：爬蟲不用等寫入，寫入不用等爬蟲。
+2. 穩定性高：限制了 DB 連線數，不會因為爬蟲暴衝而拖垮資料庫。
+3. 容錯性：如果 DB 暫時變慢，資料會堆積在 Channel (Buffer) 裡，不會直接影響爬蟲的網路請求。
